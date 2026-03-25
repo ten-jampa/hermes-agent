@@ -2710,8 +2710,28 @@ class HermesCLI:
     
     def show_history(self):
         """Display conversation history."""
+        # If no current history, try to load from database
+        if not self.conversation_history and self._session_db and self.session_id:
+            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            if restored:
+                self.conversation_history = restored
+                print(f"  ( Loaded {len(restored)} messages from session)")
+        
         if not self.conversation_history:
             print("(._.) No conversation history yet.")
+            # Offer to list saved sessions
+            if self._session_db:
+                try:
+                    sessions = self._session_db.list_sessions_rich(limit=5)
+                    if sessions:
+                        print("\n  Saved sessions:")
+                        for s in sessions:
+                            sid = (s.get("id") or "")[:25]
+                            title = (s.get("title") or "Untitled")[:25]
+                            print(f"    {sid} - {title}")
+                        print("\n  Use /resume <session-id> to view a saved session.")
+                except:
+                    pass
             return
 
         preview_limit = 400
@@ -3555,6 +3575,44 @@ class HermesCLI:
                     _cprint("  Session database not available.")
         elif canonical == "new":
             self.new_session()
+        elif canonical == "resume":
+            # Handle /resume command - resume a previous session
+            parts = cmd_original.split(maxsplit=1)
+            session_id = parts[1].strip() if len(parts) > 1 else ""
+            
+            if not session_id:
+                # List available sessions
+                if self._session_db:
+                    try:
+                        sessions = self._session_db.list_sessions_rich(limit=10)
+                        if sessions:
+                            _cprint("  Available sessions:")
+                            for s in sessions:
+                                sid = (s.get("id") or "")[:30]
+                                title = (s.get("title") or "Untitled")[:30]
+                                _cprint(f"    {sid} - {title}")
+                            _cprint("")
+                            _cprint("  Usage: /resume <session-id>")
+                        else:
+                            _cprint("  No saved sessions found.")
+                    except Exception as e:
+                        _cprint(f"  Error listing sessions: {e}")
+                else:
+                    _cprint("  Session database not available.")
+            else:
+                # Resume the specified session
+                self.session_id = session_id
+                self._resumed = True
+                _cprint(f"  Resuming session: {session_id}")
+                # Load session history
+                if self._session_db:
+                    restored = self._session_db.get_messages_as_conversation(session_id)
+                    if restored:
+                        self.conversation_history = restored
+                        _cprint(f"  Loaded {len(restored)} messages from session.")
+                    else:
+                        _cprint("  Session found but no messages. Starting fresh.")
+        
         elif canonical == "model":
             # Use original case so model names like "Anthropic/Claude-Opus-4" are preserved
             parts = cmd_original.split(maxsplit=1)
@@ -3714,6 +3772,8 @@ class HermesCLI:
             self._handle_stop_command()
         elif canonical == "background":
             self._handle_background_command(cmd_original)
+        elif canonical == "autonomous":
+            self._handle_autonomous_command(cmd_original)
         elif canonical == "queue":
             if not self._agent_running:
                 _cprint("  /queue only works while Hermes is busy. Just type your message normally.")
@@ -3974,6 +4034,164 @@ class HermesCLI:
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
+
+    def _handle_autonomous_command(self, cmd: str):
+        """Handle /autonomous <task-description> — start autonomous coding mode.
+
+        Spawns a swarm of GSD-powered Codex agents to execute the task autonomously.
+        """
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /autonomous <task-description>")
+            _cprint("  Example: /autonomous fix the login bug in auth service")
+            _cprint("  This starts an autonomous swarm to solve the problem.")
+            _cprint("")
+            _cprint("  Full spec (optional): /autonomous <task> --problem <desc> --scope <files> --tests <how>")
+            _cprint("")
+            _cprint("  Subcommands:")
+            _cprint("    /autonomous status <run-id>  — Check run status")
+            _cprint("    /autonomous logs <run-id>   — View run logs")
+            _cprint("    /autonomous list            — List recent runs")
+            return
+
+        task = parts[1].strip()
+
+        # Check for subcommands
+        if task.split()[0] in ("status", "logs", "list", "cancel"):
+            subcmd = task.split()[0]
+            arg = " ".join(task.split()[1:]) if len(task.split()) > 1 else ""
+            self._handle_autonomous_subcommand(subcmd, arg)
+            return
+
+        # Parse optional flags
+        problem = None
+        scope = None
+        tests = None
+        constraints = None
+        done_criteria = None
+        
+        # Simple flag parsing
+        if "--problem" in task:
+            idx = task.index("--problem")
+            rest = task[idx:].replace("--problem", "", 1).strip()
+            # Find next flag or end
+            for flag in ["--scope", "--tests", "--constraints", "--done"]:
+                if flag in rest:
+                    problem = rest[:rest.index(flag)].strip()
+                    rest = rest[rest.index(flag):].replace(flag, "", 1).strip()
+                    break
+            else:
+                problem = rest.strip()
+        
+        # Check if we have full spec
+        has_full_spec = problem or "--scope" in task or "--tests" in task
+        
+        if not has_full_spec:
+            # Just task description - ask for details
+            _cprint(f"  🎯 Starting autonomous mode: {task[:60]}{'...' if len(task) > 60 else ''}")
+            _cprint("  This will: 1) Clarify the problem 2) Execute via swarm 3) Deliver PR")
+            _cprint("")
+            _cprint("  📝 I need more detail. Provide full spec:")
+            _cprint("    /autonomous <task> --problem <desc> --scope <files> --tests <how>")
+            _cprint("")
+            _cprint("  Or provide detailed spec now and I'll start the swarm.")
+            return
+
+        # Start autonomous run with full spec
+        from hermes_cli.autonomous import execute_autonomous_task, check_run_status
+        
+        _cprint(f"  🎯 Starting autonomous execution: {task[:50]}{'...' if len(task) > 50 else ''}")
+        
+        try:
+            result = execute_autonomous_task(
+                task=task,
+                problem=problem,
+                scope=scope,
+                tests=tests,
+                constraints=constraints,
+                done_criteria=done_criteria,
+            )
+            
+            _cprint(f"  ✅ Autonomous task started!")
+            _cprint(f"  Run ID: {result['run_id']}")
+            _cprint(f"  ")
+            _cprint(f"  Use /autonomous status {result['run_id']} to check progress")
+            _cprint(f"  Use /autonomous logs {result['run_id']} to see results")
+            
+        except Exception as e:
+            _cprint(f"  ❌ Failed to start autonomous task: {e}")
+
+    def _handle_autonomous_subcommand(self, subcmd: str, arg: str):
+        """Handle /autonomous status/logs/list/cancel."""
+        import os
+        import json
+        from pathlib import Path
+
+        runs_dir = Path.home() / ".hermes" / "autonomous" / "runs"
+
+        if subcmd == "list":
+            if not runs_dir.exists():
+                _cprint("  No autonomous runs found.")
+                return
+            runs = sorted(runs_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+            if not runs:
+                _cprint("  No autonomous runs found.")
+                return
+            _cprint("  Recent autonomous runs:")
+            for r in runs[:10]:
+                manifest_path = r / "manifest.json"
+                if manifest_path.exists():
+                    with open(manifest_path) as f:
+                        m = json.load(f)
+                    status = m.get("status", "unknown")
+                    task = m.get("task", "unknown")[:40]
+                    _cprint(f"    {r.name} — {task}... [{status}]")
+                else:
+                    _cprint(f"    {r.name}")
+        elif subcmd == "status":
+            if not arg:
+                _cprint("  Usage: /autonomous status <run-id>")
+                return
+            
+            # Try to get live status
+            try:
+                from hermes_cli.autonomous import check_run_status
+                status = check_run_status(arg)
+                _cprint(f"  Run: {arg}")
+                _cprint(f"  Status: {status.get('status', 'unknown')}")
+                if 'task' in status:
+                    _cprint(f"  Task: {status.get('task', 'N/A')}")
+                if 'started_at' in status:
+                    _cprint(f"  Started: {status.get('started_at', 'N/A')}")
+                if 'returncode' in status:
+                    _cprint(f"  Return code: {status.get('returncode', 'N/A')}")
+                if status.get('status') == 'completed':
+                    _cprint(f"  Use /autonomous logs {arg} to see results")
+            except Exception as e:
+                _cprint(f"  Error checking status: {e}")
+        elif subcmd == "logs":
+            if not arg:
+                _cprint("  Usage: /autonomous logs <run-id>")
+                return
+            run_path = runs_dir / arg
+            if not run_path.exists():
+                _cprint(f"  Run not found: {arg}")
+                return
+            output_dir = run_path / "output"
+            if not output_dir.exists():
+                _cprint(f"  No output for {arg}")
+                return
+            # Try to show report.md first
+            report_path = output_dir / "report.md"
+            if report_path.exists():
+                with open(report_path) as f:
+                    content = f.read()
+                _cprint(f"  Report for {arg}:")
+                print(content[:2000])
+            else:
+                _cprint(f"  No report.md found. Check logs in {output_dir}")
+        elif subcmd == "cancel":
+            _cprint("  Cancel not yet implemented.")
 
     @staticmethod
     def _try_launch_chrome_debug(port: int, system: str) -> bool:
